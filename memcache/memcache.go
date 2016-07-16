@@ -68,9 +68,10 @@ var (
 const DefaultTimeout = 100 * time.Millisecond
 
 const (
-	buffered            = 8 // arbitrary buffered channel size, for readability
-	maxIdleConnsPerAddr = 2 // TODO(bradfitz): make this configurable?
+	buffered = 8 // arbitrary buffered channel size, for readability
 )
+
+var MaxIdleConnsPerAddr = int(2)
 
 // resumableError returns true if err is only a protocol-level cache error.
 // This is used to determine whether or not a server connection should
@@ -196,7 +197,7 @@ func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
 		c.freeconn = make(map[string][]*conn)
 	}
 	freelist := c.freeconn[addr.String()]
-	if len(freelist) >= maxIdleConnsPerAddr {
+	if len(freelist) >= MaxIdleConnsPerAddr {
 		cn.nc.Close()
 		return
 	}
