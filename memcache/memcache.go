@@ -292,6 +292,7 @@ func (c *Client) getConn(addr net.Addr) (*conn, error) {
 	}
 	nc, err := c.dial(addr)
 	if err != nil {
+		c.releaseActiveConnSlot(addr)
 		return nil, err
 	}
 	cn = &conn{
