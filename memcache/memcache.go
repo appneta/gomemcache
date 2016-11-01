@@ -73,6 +73,8 @@ const (
 
 var MaxIdleConnsPerAddr = int(2)
 
+var MaxConnsPerAddr = int(2)
+
 // resumableError returns true if err is only a protocol-level cache error.
 // This is used to determine whether or not a server connection should
 // be re-used or not. If an error occurs, by default we don't reuse the
@@ -124,7 +126,13 @@ func New(server ...string) *Client {
 
 // NewFromSelector returns a new Client using the provided ServerSelector.
 func NewFromSelector(ss ServerSelector) *Client {
-	return &Client{selector: ss}
+	c := &Client{
+		selector:       ss,
+		numActiveConns: map[string]int{},
+		freeconn:       map[string][]*conn{},
+	}
+	c.cond = sync.NewCond(&c.lk)
+	return c
 }
 
 // Client is a memcache client.
@@ -136,8 +144,10 @@ type Client struct {
 
 	selector ServerSelector
 
-	lk       sync.Mutex
-	freeconn map[string][]*conn
+	lk             sync.Mutex
+	cond           *sync.Cond
+	numActiveConns map[string]int
+	freeconn       map[string][]*conn
 }
 
 // Item is an item to be got or stored in a memcached server.
@@ -188,14 +198,18 @@ func (cn *conn) condRelease(err *error) {
 	} else {
 		cn.nc.Close()
 	}
+	// Regardless of whether this connection is reusable, we should decrement the numActiveConns
+	// counter and then single the cond to wake up any goroutines waiting for a free active
+	// connection slot to open up.
+	cn.c.lk.Lock()
+	cn.c.numActiveConns[cn.addr.String()] -= 1
+	cn.c.lk.Unlock()
+	cn.c.cond.Signal()
 }
 
 func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
 	c.lk.Lock()
 	defer c.lk.Unlock()
-	if c.freeconn == nil {
-		c.freeconn = make(map[string][]*conn)
-	}
 	freelist := c.freeconn[addr.String()]
 	if len(freelist) >= MaxIdleConnsPerAddr {
 		cn.nc.Close()
@@ -256,6 +270,13 @@ func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 }
 
 func (c *Client) getConn(addr net.Addr) (*conn, error) {
+	c.lk.Lock()
+	// Wait for a free active connection slot to open up.
+	for c.numActiveConns[addr.String()] >= MaxConnsPerAddr {
+		c.cond.Wait()
+	}
+	c.numActiveConns[addr.String()] += 1
+	c.lk.Unlock()
 	cn, ok := c.getFreeConn(addr)
 	if ok {
 		cn.extendDeadline()
