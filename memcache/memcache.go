@@ -198,9 +198,8 @@ func (cn *conn) condRelease(err *error) {
 	} else {
 		cn.nc.Close()
 	}
-	// Regardless of whether this connection is reusable, we should decrement the numActiveConns
-	// counter and then single the cond to wake up any goroutines waiting for a free active
-	// connection slot to open up.
+	// Regardless of whether this connection is reusable, we should release the active
+	// connection slot.
 	cn.c.releaseActiveConnSlot(cn.addr)
 }
 
@@ -272,14 +271,17 @@ func (c *Client) acquireActiveConnSlot(addr net.Addr) {
 	for c.numActiveConns[addr.String()] >= MaxConnsPerAddr {
 		c.cond.Wait()
 	}
+	// Increment the number of active connections for this address
 	c.numActiveConns[addr.String()] += 1
 	c.lk.Unlock()
 }
 
 func (c *Client) releaseActiveConnSlot(addr net.Addr) {
 	c.lk.Lock()
+	// Decrement the number of active connections for this address
 	c.numActiveConns[addr.String()] -= 1
 	c.lk.Unlock()
+	// Signal the cond to wake up a goroutine (if any) waiting for a free active connection slot
 	c.cond.Signal()
 }
 
