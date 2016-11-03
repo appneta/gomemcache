@@ -126,13 +126,7 @@ func New(server ...string) *Client {
 
 // NewFromSelector returns a new Client using the provided ServerSelector.
 func NewFromSelector(ss ServerSelector) *Client {
-	c := &Client{
-		selector:       ss,
-		numActiveConns: map[string]int{},
-		freeconn:       map[string][]*conn{},
-	}
-	c.cond = sync.NewCond(&c.lk)
-	return c
+	return &Client{selector: ss}
 }
 
 // Client is a memcache client.
@@ -144,10 +138,9 @@ type Client struct {
 
 	selector ServerSelector
 
-	lk             sync.Mutex
-	cond           *sync.Cond
-	numActiveConns map[string]int
-	freeconn       map[string][]*conn
+	lk              sync.Mutex
+	activeConnSlots map[string]chan bool
+	freeconn        map[string][]*conn
 }
 
 // Item is an item to be got or stored in a memcached server.
@@ -206,6 +199,9 @@ func (cn *conn) condRelease(err *error) {
 func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
 	c.lk.Lock()
 	defer c.lk.Unlock()
+	if c.freeconn == nil {
+		c.freeconn = make(map[string][]*conn)
+	}
 	freelist := c.freeconn[addr.String()]
 	if len(freelist) >= MaxIdleConnsPerAddr {
 		cn.nc.Close()
@@ -247,6 +243,14 @@ func (cte *ConnectTimeoutError) Error() string {
 	return "memcache: connect timeout to " + cte.Addr.String()
 }
 
+type PoolTimeoutError struct {
+	Addr net.Addr
+}
+
+func (pte *PoolTimeoutError) Error() string {
+	return "memcache: pool timeout to " + pte.Addr.String()
+}
+
 func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 	type connError struct {
 		cn  net.Conn
@@ -265,28 +269,49 @@ func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 	return nil, err
 }
 
-func (c *Client) acquireActiveConnSlot(addr net.Addr) {
+func (c *Client) acquireActiveConnSlot(addr net.Addr) error {
 	c.lk.Lock()
-	// Wait for a free active connection slot to open up.
-	for c.numActiveConns[addr.String()] >= MaxConnsPerAddr {
-		c.cond.Wait()
+	if c.activeConnSlots == nil {
+		c.activeConnSlots = make(map[string]chan bool)
 	}
-	// Increment the number of active connections for this address
-	c.numActiveConns[addr.String()] += 1
+	chanSlots := c.activeConnSlots[addr.String()]
+	if chanSlots == nil {
+		// If we've never seen this address before, instantiate a buffered channel
+		// holding the desired number of slots (represented by `true` values)
+		chanSlots = make(chan bool, MaxConnsPerAddr)
+		for i := 0; i < MaxConnsPerAddr; i++ {
+			chanSlots <- true
+		}
+		c.activeConnSlots[addr.String()] = chanSlots
+	}
 	c.lk.Unlock()
+
+	// Wait for a free active connection slot to open up.
+	select {
+	case <-chanSlots:
+		return nil
+	case <-time.After(c.Timeout):
+		return &PoolTimeoutError{addr}
+	}
 }
 
 func (c *Client) releaseActiveConnSlot(addr net.Addr) {
 	c.lk.Lock()
-	// Decrement the number of active connections for this address
-	c.numActiveConns[addr.String()] -= 1
+	chanSlots := c.activeConnSlots[addr.String()]
 	c.lk.Unlock()
-	// Signal the cond to wake up a goroutine (if any) waiting for a free active connection slot
-	c.cond.Signal()
+	select {
+	case chanSlots <- true:
+		return
+	default:
+		panic("memcache: releaseActiveConnSlot blocked sending to chanSlots channel")
+	}
 }
 
 func (c *Client) getConn(addr net.Addr) (*conn, error) {
-	c.acquireActiveConnSlot(addr)
+	err := c.acquireActiveConnSlot(addr)
+	if err != nil {
+		return nil, err
+	}
 	cn, ok := c.getFreeConn(addr)
 	if ok {
 		cn.extendDeadline()
