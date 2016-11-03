@@ -67,6 +67,9 @@ var (
 // DefaultTimeout is the default socket read/write timeout.
 const DefaultTimeout = 100 * time.Millisecond
 
+// activeConnectionSlot is just a sugar type for the MaxConnsPerAddr logic
+type activeConnectionSlot bool
+
 const (
 	buffered = 8 // arbitrary buffered channel size, for readability
 )
@@ -139,7 +142,7 @@ type Client struct {
 	selector ServerSelector
 
 	lk              sync.Mutex
-	activeConnSlots map[string]chan bool
+	activeConnSlots map[string]chan activeConnectionSlot
 	freeconn        map[string][]*conn
 }
 
@@ -191,8 +194,8 @@ func (cn *conn) condRelease(err *error) {
 	} else {
 		cn.nc.Close()
 	}
-	// Regardless of whether this connection is reusable, we should release the active
-	// connection slot.
+	// Regardless of whether this particular *connection* is reusable, we release
+	// the active connection slot for this *address*.
 	cn.c.releaseActiveConnSlot(cn.addr)
 }
 
@@ -272,21 +275,25 @@ func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 func (c *Client) acquireActiveConnSlot(addr net.Addr) error {
 	c.lk.Lock()
 	if c.activeConnSlots == nil {
-		c.activeConnSlots = make(map[string]chan bool)
+		// Lazy-initialize the map of channels; this should only happen once per Client.
+		c.activeConnSlots = make(map[string]chan activeConnectionSlot)
 	}
 	chanSlots := c.activeConnSlots[addr.String()]
 	if chanSlots == nil {
 		// If we've never seen this address before, instantiate a buffered channel
-		// holding the desired number of slots (represented by `true` values)
-		chanSlots = make(chan bool, MaxConnsPerAddr)
+		// holding the desired number of slots (represented by `true` values).
+		chanSlots = make(chan activeConnectionSlot, MaxConnsPerAddr)
 		for i := 0; i < MaxConnsPerAddr; i++ {
-			chanSlots <- true
+			// These calls should never block because we've allocated a buffered channel
+			// of just the right size.
+			chanSlots <- activeConnectionSlot(true)
 		}
 		c.activeConnSlots[addr.String()] = chanSlots
 	}
 	c.lk.Unlock()
 
-	// Wait for a free active connection slot to open up.
+	// Wait for a free active connection slot to open up, timing out if we can't get a slot
+	// from the pool before Timeout elapses.
 	select {
 	case <-chanSlots:
 		return nil
@@ -299,12 +306,10 @@ func (c *Client) releaseActiveConnSlot(addr net.Addr) {
 	c.lk.Lock()
 	chanSlots := c.activeConnSlots[addr.String()]
 	c.lk.Unlock()
-	select {
-	case chanSlots <- true:
-		return
-	default:
-		panic("memcache: releaseActiveConnSlot blocked sending to chanSlots channel")
-	}
+	// Send a `true` back to the channel, indicating that this slot is free to use again.
+	// This call should never block because the channel buffer should always have room
+	// enough for all of the available connection slots.
+	chanSlots <- activeConnectionSlot(true)
 }
 
 func (c *Client) getConn(addr net.Addr) (*conn, error) {
