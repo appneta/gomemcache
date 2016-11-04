@@ -68,14 +68,23 @@ var (
 const DefaultTimeout = 100 * time.Millisecond
 
 // activeConnectionSlot is just a sugar type for the MaxConnsPerAddr logic
-type activeConnectionSlot bool
+type activeConnSlot bool
 
 const (
 	buffered = 8 // arbitrary buffered channel size, for readability
 )
 
+// MaxIdleConnsPerAddr specifies the maximum number of connections to leave open per
+// address despite not actively being used to service a request. Note that setting this
+// too low can paradoxically result in TCP/IP dynamic port exhaustion due to ports
+// needing to remain in TIME_WAIT state between uses. To avoid this, set
+// MaxConnsPerAddr and MaxIdleConnsPerAddr to the same value.
 var MaxIdleConnsPerAddr = int(2)
 
+// MaxConnsPerAddr specifies the maximum number of concurrent connections to use per
+// address to service requests. This value should be set prior to instantiating any
+// Clients (i.e. via New or NewFromSelector). If you change this setting, you may also
+// wish to change MaxIdleConnsPerAddr; see the comment on that property for more details.
 var MaxConnsPerAddr = int(2)
 
 // resumableError returns true if err is only a protocol-level cache error.
@@ -142,7 +151,7 @@ type Client struct {
 	selector ServerSelector
 
 	lk              sync.Mutex
-	activeConnSlots map[string]chan activeConnectionSlot
+	activeConnSlots map[string]chan activeConnSlot
 	freeconn        map[string][]*conn
 }
 
@@ -276,17 +285,17 @@ func (c *Client) acquireActiveConnSlot(addr net.Addr) error {
 	c.lk.Lock()
 	if c.activeConnSlots == nil {
 		// Lazy-initialize the map of channels; this should only happen once per Client.
-		c.activeConnSlots = make(map[string]chan activeConnectionSlot)
+		c.activeConnSlots = make(map[string]chan activeConnSlot)
 	}
 	chanSlots := c.activeConnSlots[addr.String()]
 	if chanSlots == nil {
 		// If we've never seen this address before, instantiate a buffered channel
 		// holding the desired number of slots (represented by `true` values).
-		chanSlots = make(chan activeConnectionSlot, MaxConnsPerAddr)
+		chanSlots = make(chan activeConnSlot, MaxConnsPerAddr)
 		for i := 0; i < MaxConnsPerAddr; i++ {
 			// These calls should never block because we've allocated a buffered channel
 			// of just the right size.
-			chanSlots <- activeConnectionSlot(true)
+			chanSlots <- activeConnSlot(true)
 		}
 		c.activeConnSlots[addr.String()] = chanSlots
 	}
@@ -306,10 +315,10 @@ func (c *Client) releaseActiveConnSlot(addr net.Addr) {
 	c.lk.Lock()
 	chanSlots := c.activeConnSlots[addr.String()]
 	c.lk.Unlock()
-	// Send a `true` back to the channel, indicating that this slot is free to use again.
-	// This call should never block because the channel buffer should always have room
-	// enough for all of the available connection slots.
-	chanSlots <- activeConnectionSlot(true)
+	// Return the active connection slot back to the channel. This call should never block
+	// because the channel buffer should always have room enough for all of the available
+	// connection slots.
+	chanSlots <- activeConnSlot(true)
 }
 
 func (c *Client) getConn(addr net.Addr) (*conn, error) {
