@@ -67,11 +67,25 @@ var (
 // DefaultTimeout is the default socket read/write timeout.
 const DefaultTimeout = 100 * time.Millisecond
 
+// activeConnectionSlot is just a sugar type for the MaxConnsPerAddr logic
+type activeConnSlot bool
+
 const (
 	buffered = 8 // arbitrary buffered channel size, for readability
 )
 
+// MaxIdleConnsPerAddr specifies the maximum number of connections to leave open per
+// address despite not actively being used to service a request. Note that setting this
+// too low can paradoxically result in TCP/IP dynamic port exhaustion due to ports
+// needing to remain in TIME_WAIT state between uses. To avoid this, set
+// MaxConnsPerAddr and MaxIdleConnsPerAddr to the same value.
 var MaxIdleConnsPerAddr = int(2)
+
+// MaxConnsPerAddr specifies the maximum number of concurrent connections to use per
+// address to service requests. This value should be set prior to instantiating any
+// Clients (i.e. via New or NewFromSelector). If you change this setting, you may also
+// wish to change MaxIdleConnsPerAddr; see the comment on that property for more details.
+var MaxConnsPerAddr = int(2)
 
 // resumableError returns true if err is only a protocol-level cache error.
 // This is used to determine whether or not a server connection should
@@ -136,8 +150,9 @@ type Client struct {
 
 	selector ServerSelector
 
-	lk       sync.Mutex
-	freeconn map[string][]*conn
+	lk              sync.Mutex
+	activeConnSlots map[string]chan activeConnSlot
+	freeconn        map[string][]*conn
 }
 
 // Item is an item to be got or stored in a memcached server.
@@ -188,6 +203,9 @@ func (cn *conn) condRelease(err *error) {
 	} else {
 		cn.nc.Close()
 	}
+	// Regardless of whether this particular *connection* is reusable, we release
+	// the active connection slot for this *address*.
+	cn.c.releaseActiveConnSlot(cn.addr)
 }
 
 func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
@@ -237,6 +255,14 @@ func (cte *ConnectTimeoutError) Error() string {
 	return "memcache: connect timeout to " + cte.Addr.String()
 }
 
+type PoolTimeoutError struct {
+	Addr net.Addr
+}
+
+func (pte *PoolTimeoutError) Error() string {
+	return "memcache: pool timeout to " + pte.Addr.String()
+}
+
 func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 	type connError struct {
 		cn  net.Conn
@@ -255,7 +281,51 @@ func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 	return nil, err
 }
 
+func (c *Client) acquireActiveConnSlot(addr net.Addr) error {
+	c.lk.Lock()
+	if c.activeConnSlots == nil {
+		// Lazy-initialize the map of channels; this should only happen once per Client.
+		c.activeConnSlots = make(map[string]chan activeConnSlot)
+	}
+	chanSlots := c.activeConnSlots[addr.String()]
+	if chanSlots == nil {
+		// If we've never seen this address before, instantiate a buffered channel
+		// holding the desired number of slots (represented by `true` values).
+		chanSlots = make(chan activeConnSlot, MaxConnsPerAddr)
+		for i := 0; i < MaxConnsPerAddr; i++ {
+			// These calls should never block because we've allocated a buffered channel
+			// of just the right size.
+			chanSlots <- activeConnSlot(true)
+		}
+		c.activeConnSlots[addr.String()] = chanSlots
+	}
+	c.lk.Unlock()
+
+	// Wait for a free active connection slot to open up, timing out if we can't get a slot
+	// from the pool before Timeout elapses.
+	select {
+	case <-chanSlots:
+		return nil
+	case <-time.After(c.Timeout):
+		return &PoolTimeoutError{addr}
+	}
+}
+
+func (c *Client) releaseActiveConnSlot(addr net.Addr) {
+	c.lk.Lock()
+	chanSlots := c.activeConnSlots[addr.String()]
+	c.lk.Unlock()
+	// Return the active connection slot back to the channel. This call should never block
+	// because the channel buffer should always have room enough for all of the available
+	// connection slots.
+	chanSlots <- activeConnSlot(true)
+}
+
 func (c *Client) getConn(addr net.Addr) (*conn, error) {
+	err := c.acquireActiveConnSlot(addr)
+	if err != nil {
+		return nil, err
+	}
 	cn, ok := c.getFreeConn(addr)
 	if ok {
 		cn.extendDeadline()
@@ -263,6 +333,7 @@ func (c *Client) getConn(addr net.Addr) (*conn, error) {
 	}
 	nc, err := c.dial(addr)
 	if err != nil {
+		c.releaseActiveConnSlot(addr)
 		return nil, err
 	}
 	cn = &conn{
